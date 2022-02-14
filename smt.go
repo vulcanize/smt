@@ -17,10 +17,21 @@ var errKeyAlreadyEmpty = errors.New("key already empty")
 
 // SparseMerkleTree is a Sparse Merkle tree.
 type SparseMerkleTree struct {
-	th                      treeHasher
-	nodes, values           MapStore
+	th            treeHasher
+	nodes, values MapStore
+	// TODO: make caching more intelligent, be able to configure a cache size and if we exceed this size auto-flush to disk
 	dirtyNodes, dirtyValues *SimpleMap
-	root                    []byte
+	// TODO: separate cache for tracking delete operations
+	root        []byte
+	nodesListen chan []byte
+	kvListen    chan KVPair
+	// TODO: separate channel for indicating to a listening service which nodes were deleted
+}
+
+// KVPair for listening to KVPairs
+type KVPair struct {
+	Key   string
+	Value []byte
 }
 
 // NewSparseMerkleTree creates a new Sparse Merkle tree on an empty MapStore.
@@ -105,18 +116,51 @@ func (smt *SparseMerkleTree) Has(key []byte) (bool, error) {
 }
 
 // Commit flushes all dirty nodes and values to the backing (persistent) MapStore
+// and, if the SMT is configured with listeners, it streams nodes and kvPairs to the listeners
+// this dirty streaming enables us to perform efficient statediffing- efficient export of SC + SS to an external service
 func (smt *SparseMerkleTree) Commit() error {
-	for key, val := range smt.dirtyNodes.m {
-		if err := smt.nodes.Set([]byte(key), val); err != nil {
-			return err
+	// TODO: separate map for tracking dirty deletes and signifying them to the listener
+	// I know this is ugly code replication, but it's better to perform two nil checks
+	// than a nil check on each iteration of dirtyNodes and dirtyValues
+	if smt.kvListen == nil {
+		for key, val := range smt.dirtyValues.m {
+			if err := smt.values.Set([]byte(key), val); err != nil {
+				return err
+			}
+		}
+	} else {
+		for key, val := range smt.dirtyValues.m {
+			if err := smt.values.Set([]byte(key), val); err != nil {
+				return err
+			}
+			smt.kvListen <- KVPair{key, val}
 		}
 	}
-	for key, val := range smt.dirtyValues.m {
-		if err := smt.values.Set([]byte(key), val); err != nil {
-			return err
+	if smt.nodesListen == nil {
+		for key, val := range smt.dirtyNodes.m {
+			if err := smt.nodes.Set([]byte(key), val); err != nil {
+				return err
+			}
+		}
+	} else {
+		for key, val := range smt.dirtyNodes.m {
+			if err := smt.nodes.Set([]byte(key), val); err != nil {
+				return err
+			}
+			smt.nodesListen <- val
 		}
 	}
 	return nil
+}
+
+// SetNodeListener to configure the SMT with a channel to write dirty nodes out to during Commit
+func (smt *SparseMerkleTree) SetNodeListener(listener chan []byte) {
+	smt.nodesListen = listener
+}
+
+// SetKVListener to configure the SMT with a channel to write dirty kv pairs out to during Commit
+func (smt *SparseMerkleTree) SetKVListener(listener chan KVPair) {
+	smt.kvListen = listener
 }
 
 // Update sets a new value for a key in the tree, and sets and returns the new root of the tree.
