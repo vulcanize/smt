@@ -34,14 +34,14 @@ func (dsmst *DeepSparseMerkleSubTree) AddBranch(proof SparseMerkleProof, key []b
 	}
 
 	if !bytes.Equal(value, defaultValue) { // Membership proof.
-		if err := dsmst.values.Set(dsmst.th.path(key), value); err != nil {
+		if err := dsmst.dirtyValues.Set(dsmst.th.path(key), value); err != nil {
 			return err
 		}
 	}
 
 	// Update nodes along branch
 	for _, update := range updates {
-		err := dsmst.nodes.Set(update[0], update[1])
+		err := dsmst.dirtyNodes.Set(update[0], update[1])
 		if err != nil {
 			return err
 		}
@@ -50,7 +50,7 @@ func (dsmst *DeepSparseMerkleSubTree) AddBranch(proof SparseMerkleProof, key []b
 	// Update sibling node
 	if proof.SiblingData != nil {
 		if proof.SideNodes != nil && len(proof.SideNodes) > 0 {
-			err := dsmst.nodes.Set(proof.SideNodes[0], proof.SiblingData)
+			err := dsmst.dirtyNodes.Set(proof.SideNodes[0], proof.SiblingData)
 			if err != nil {
 				return err
 			}
@@ -75,10 +75,17 @@ func (smt *SparseMerkleTree) GetDescend(key []byte) ([]byte, error) {
 	path := smt.th.path(key)
 	currentHash := root
 	for i := 0; i < smt.depth(); i++ {
-		currentData, err := smt.nodes.Get(currentHash)
+		// Try dirty cache first
+		var currentData []byte
+		var err error
+		currentData, err = smt.dirtyNodes.Get(currentHash)
 		if err != nil {
-			return nil, err
-		} else if smt.th.isLeaf(currentData) {
+			currentData, err = smt.nodes.Get(currentHash)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if smt.th.isLeaf(currentData) {
 			// We've reached the end. Is this the actual leaf?
 			p, _ := smt.th.parseLeaf(currentData)
 			if !bytes.Equal(path, p) {
@@ -86,9 +93,14 @@ func (smt *SparseMerkleTree) GetDescend(key []byte) ([]byte, error) {
 				return defaultValue, nil
 			}
 			// Otherwise, yes. Return the value.
-			value, err := smt.values.Get(path)
+			// Try dirty cache first
+			var value []byte
+			value, err = smt.dirtyValues.Get(path)
 			if err != nil {
-				return nil, err
+				value, err = smt.values.Get(path)
+				if err != nil {
+					return nil, err
+				}
 			}
 			return value, nil
 		}
@@ -109,9 +121,15 @@ func (smt *SparseMerkleTree) GetDescend(key []byte) ([]byte, error) {
 	// The following lines of code should only be reached if the path is 256
 	// nodes high, which should be very unlikely if the underlying hash function
 	// is collision-resistant.
-	value, err := smt.values.Get(path)
+	// Try dirty cache first
+	var value []byte
+	var err error
+	value, err = smt.dirtyValues.Get(path)
 	if err != nil {
-		return nil, err
+		value, err = smt.values.Get(path)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return value, nil
 }

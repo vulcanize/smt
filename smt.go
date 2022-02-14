@@ -17,9 +17,10 @@ var errKeyAlreadyEmpty = errors.New("key already empty")
 
 // SparseMerkleTree is a Sparse Merkle tree.
 type SparseMerkleTree struct {
-	th            treeHasher
-	nodes, values MapStore
-	root          []byte
+	th                      treeHasher
+	nodes, values           MapStore
+	dirtyNodes, dirtyValues *SimpleMap
+	root                    []byte
 }
 
 // NewSparseMerkleTree creates a new Sparse Merkle tree on an empty MapStore.
@@ -74,18 +75,23 @@ func (smt *SparseMerkleTree) Get(key []byte) ([]byte, error) {
 		return defaultValue, nil
 	}
 
+	// Try dirty cache first
 	path := smt.th.path(key)
-	value, err := smt.values.Get(path)
-
+	var value []byte
+	var err error
+	value, err = smt.dirtyValues.Get(path)
 	if err != nil {
-		var invalidKeyError *InvalidKeyError
+		value, err = smt.values.Get(path)
+		if err != nil {
+			var invalidKeyError *InvalidKeyError
 
-		if errors.As(err, &invalidKeyError) {
-			// If key isn't found, return default value
-			return defaultValue, nil
-		} else {
-			// Otherwise percolate up any other error
-			return nil, err
+			if errors.As(err, &invalidKeyError) {
+				// If key isn't found, return default value
+				return defaultValue, nil
+			} else {
+				// Otherwise percolate up any other error
+				return nil, err
+			}
 		}
 	}
 	return value, nil
@@ -96,6 +102,21 @@ func (smt *SparseMerkleTree) Get(key []byte) ([]byte, error) {
 func (smt *SparseMerkleTree) Has(key []byte) (bool, error) {
 	val, err := smt.Get(key)
 	return !bytes.Equal(defaultValue, val), err
+}
+
+// Commit flushes all dirty nodes and values to the backing (persistent) MapStore
+func (smt *SparseMerkleTree) Commit() error {
+	for key, val := range smt.dirtyNodes.m {
+		if err := smt.nodes.Set([]byte(key), val); err != nil {
+			return err
+		}
+	}
+	for key, val := range smt.dirtyValues.m {
+		if err := smt.values.Set([]byte(key), val); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Update sets a new value for a key in the tree, and sets and returns the new root of the tree.
@@ -129,8 +150,11 @@ func (smt *SparseMerkleTree) UpdateForRoot(key []byte, value []byte, root []byte
 			// This key is already empty; return the old root.
 			return root, nil
 		}
-		if err := smt.values.Delete(path); err != nil {
-			return nil, err
+		// Try to delete from dirty cache first
+		if err := smt.dirtyValues.Delete(path); err != nil {
+			if err := smt.values.Delete(path); err != nil {
+				return nil, err
+			}
 		}
 
 	} else {
@@ -157,8 +181,11 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 	}
 	// All nodes above the deleted leaf are now orphaned
 	for _, node := range pathNodes {
-		if err := smt.nodes.Delete(node); err != nil {
-			return nil, err
+		// Try to delete from dirty cache first
+		if err := smt.dirtyNodes.Delete(node); err != nil {
+			if err := smt.nodes.Delete(node); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -166,11 +193,16 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 	nonPlaceholderReached := false
 	for i, sideNode := range sideNodes {
 		if currentData == nil {
-			sideNodeValue, err := smt.nodes.Get(sideNode)
+			// Check dirty cache first
+			var sideNodeValue []byte
+			var err error
+			sideNodeValue, err = smt.dirtyNodes.Get(sideNode)
 			if err != nil {
-				return nil, err
+				sideNodeValue, err = smt.nodes.Get(sideNode)
+				if err != nil {
+					return nil, err
+				}
 			}
-
 			if smt.th.isLeaf(sideNodeValue) {
 				// This is the leaf sibling that needs to be bubbled up the tree.
 				currentHash = sideNode
@@ -198,7 +230,7 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 		} else {
 			currentHash, currentData = smt.th.digestNode(currentData, sideNode)
 		}
-		if err := smt.nodes.Set(currentHash, currentData); err != nil {
+		if err := smt.dirtyNodes.Set(currentHash, currentData); err != nil {
 			return nil, err
 		}
 		currentData = currentHash
@@ -214,7 +246,7 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, sideNodes [][]byte, pathNodes [][]byte, oldLeafData []byte) ([]byte, error) {
 	valueHash := smt.th.digest(value)
 	currentHash, currentData := smt.th.digestLeaf(path, valueHash)
-	if err := smt.nodes.Set(currentHash, currentData); err != nil {
+	if err := smt.dirtyNodes.Set(currentHash, currentData); err != nil {
 		return nil, err
 	}
 	currentData = currentHash
@@ -241,7 +273,7 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 			currentHash, currentData = smt.th.digestNode(currentData, pathNodes[0])
 		}
 
-		err := smt.nodes.Set(currentHash, currentData)
+		err := smt.dirtyNodes.Set(currentHash, currentData)
 		if err != nil {
 			return nil, err
 		}
@@ -253,17 +285,26 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 			return smt.root, nil
 		}
 		// If an old leaf exists, remove it
-		if err := smt.nodes.Delete(pathNodes[0]); err != nil {
-			return nil, err
+		// Try the dirty caches first
+		if err := smt.dirtyNodes.Delete(pathNodes[0]); err != nil {
+			if err := smt.nodes.Delete(pathNodes[0]); err != nil {
+				return nil, err
+			}
 		}
-		if err := smt.values.Delete(path); err != nil {
-			return nil, err
+		if err := smt.dirtyValues.Delete(path); err != nil {
+			if err := smt.values.Delete(path); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// All remaining path nodes are orphaned
 	for i := 1; i < len(pathNodes); i++ {
-		if err := smt.nodes.Delete(pathNodes[i]); err != nil {
-			return nil, err
+		// Try the dirty cache first
+		// TODO: I think we need a separate cache for Deletes, because there won't be an entry in the cache map for them when we iterate to flush to disk
+		if err := smt.dirtyNodes.Delete(pathNodes[i]); err != nil {
+			if err := smt.nodes.Delete(pathNodes[i]); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -293,13 +334,13 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 		} else {
 			currentHash, currentData = smt.th.digestNode(currentData, sideNode)
 		}
-		err := smt.nodes.Set(currentHash, currentData)
+		err := smt.dirtyNodes.Set(currentHash, currentData)
 		if err != nil {
 			return nil, err
 		}
 		currentData = currentHash
 	}
-	if err := smt.values.Set(path, value); err != nil {
+	if err := smt.dirtyValues.Set(path, value); err != nil {
 		return nil, err
 	}
 
@@ -324,10 +365,17 @@ func (smt *SparseMerkleTree) sideNodesForRoot(path []byte, root []byte, getSibli
 		return sideNodes, pathNodes, nil, nil, nil
 	}
 
-	currentData, err := smt.nodes.Get(root)
+	// Try dirty cache first
+	var currentData []byte
+	var err error
+	currentData, err = smt.dirtyNodes.Get(root)
 	if err != nil {
-		return nil, nil, nil, nil, err
-	} else if smt.th.isLeaf(currentData) {
+		currentData, err = smt.nodes.Get(root)
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
+	if smt.th.isLeaf(currentData) {
 		// If the root is a leaf, there are also no sidenodes to return.
 		return sideNodes, pathNodes, currentData, nil, nil
 	}
@@ -354,20 +402,28 @@ func (smt *SparseMerkleTree) sideNodesForRoot(path []byte, root []byte, getSibli
 			currentData = nil
 			break
 		}
-
-		currentData, err = smt.nodes.Get(nodeHash)
+		// Try dirty cache first
+		currentData, err = smt.dirtyNodes.Get(nodeHash)
 		if err != nil {
-			return nil, nil, nil, nil, err
-		} else if smt.th.isLeaf(currentData) {
+			currentData, err = smt.nodes.Get(nodeHash)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
+		}
+		if smt.th.isLeaf(currentData) {
 			// If the node is a leaf, we've reached the end.
 			break
 		}
 	}
 
 	if getSiblingData {
-		siblingData, err = smt.nodes.Get(sideNode)
+		// Try dirty cache first
+		siblingData, err = smt.dirtyNodes.Get(sideNode)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			siblingData, err = smt.nodes.Get(sideNode)
+			if err != nil {
+				return nil, nil, nil, nil, err
+			}
 		}
 	}
 	return reverseByteSlices(sideNodes), reverseByteSlices(pathNodes), currentData, siblingData, nil
