@@ -24,6 +24,8 @@ type SparseMerkleTree struct {
 	th            treeHasher
 	nodes, values MapStore
 	// TODO: make caching more intelligent, be able to configure a cache size and if we exceed this size auto-flush to disk
+	// although the problem with this is that it disrupts our ability to track (listen) to only the nodes/values
+	// that were updated in a block (in a cache/commit cycle)
 	dirtyNodes, dirtyValues             *SimpleMap
 	dirtyNodeDeletes, dirtyValueDeletes map[string]struct{}
 	root                                []byte
@@ -67,10 +69,14 @@ func NewSparseMerkleTree(nodes, values MapStore, hasher hash.Hash, options ...Op
 // ImportSparseMerkleTree imports a Sparse Merkle tree from a non-empty MapStore.
 func ImportSparseMerkleTree(nodes, values MapStore, hasher hash.Hash, root []byte) *SparseMerkleTree {
 	smt := SparseMerkleTree{
-		th:     *newTreeHasher(hasher),
-		nodes:  nodes,
-		values: values,
-		root:   root,
+		th:                *newTreeHasher(hasher),
+		nodes:             nodes,
+		values:            values,
+		root:              root,
+		dirtyNodes:        NewSimpleMap(),
+		dirtyValues:       NewSimpleMap(),
+		dirtyNodeDeletes:  make(map[string]struct{}),
+		dirtyValueDeletes: make(map[string]struct{}),
 	}
 	return &smt
 }
@@ -128,9 +134,10 @@ func (smt *SparseMerkleTree) Has(key []byte) (bool, error) {
 	return !bytes.Equal(defaultValue, val), err
 }
 
-// Commit flushes all dirty nodes and values to the backing (persistent) MapStore
-// and, if the SMT is configured with listeners, it streams nodes and kvPairs to the listeners
-// this dirty streaming enables us to perform efficient statediffing- efficient export of SC + SS to an external service
+// Commit flushes all dirty node and value operations to the backing (persistent) MapStore
+// and, if the SMT is configured with listeners, it streams these operations to the listeners
+// this dirty streaming enables us to perform efficient statediffing- efficient export of SC + SS to an external service]
+// it resets of the dirty caches after flushing
 func (smt *SparseMerkleTree) Commit() error {
 	// I know this is ugly code replication, but it's better to perform two nil checks
 	// than a nil check on each iteration of these maps
@@ -140,11 +147,13 @@ func (smt *SparseMerkleTree) Commit() error {
 				return err
 			}
 		}
-		for key := range smt.dirtyNodeDeletes {
+		smt.dirtyValues = NewSimpleMap()
+		for key := range smt.dirtyValueDeletes {
 			if err := smt.values.Delete([]byte(key)); err != nil {
 				return err
 			}
 		}
+		smt.dirtyValueDeletes = make(map[string]struct{})
 	} else {
 		for key, val := range smt.dirtyValues.m {
 			if err := smt.values.Set([]byte(key), val); err != nil {
@@ -152,12 +161,14 @@ func (smt *SparseMerkleTree) Commit() error {
 			}
 			smt.kvListen <- KVPair{key, val, false}
 		}
-		for key := range smt.dirtyNodeDeletes {
+		smt.dirtyValues = NewSimpleMap()
+		for key := range smt.dirtyValueDeletes {
 			if err := smt.values.Delete([]byte(key)); err != nil {
 				return err
 			}
 			smt.kvListen <- KVPair{key, nil, true}
 		}
+		smt.dirtyValueDeletes = make(map[string]struct{})
 	}
 	if smt.nodesListen == nil {
 		for key, val := range smt.dirtyNodes.m {
@@ -165,11 +176,13 @@ func (smt *SparseMerkleTree) Commit() error {
 				return err
 			}
 		}
+		smt.dirtyNodes = NewSimpleMap()
 		for key := range smt.dirtyNodeDeletes {
 			if err := smt.nodes.Delete([]byte(key)); err != nil {
 				return err
 			}
 		}
+		smt.dirtyNodeDeletes = make(map[string]struct{})
 	} else {
 		for key, val := range smt.dirtyNodes.m {
 			if err := smt.nodes.Set([]byte(key), val); err != nil {
@@ -177,12 +190,14 @@ func (smt *SparseMerkleTree) Commit() error {
 			}
 			smt.nodesListen <- Node{[]byte(key), val, false}
 		}
+		smt.dirtyNodes = NewSimpleMap()
 		for key := range smt.dirtyNodeDeletes {
 			if err := smt.nodes.Delete([]byte(key)); err != nil {
 				return err
 			}
 			smt.nodesListen <- Node{[]byte(key), nil, true}
 		}
+		smt.dirtyNodeDeletes = make(map[string]struct{})
 	}
 	return nil
 }
@@ -392,7 +407,6 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 	// All remaining path nodes are orphaned
 	for i := 1; i < len(pathNodes); i++ {
 		// Try the dirty cache first
-		// TODO: I think we need a separate cache for Deletes, because there won't be an entry in the cache map for them when we iterate to flush to disk
 		if err := smt.dirtyNodes.Delete(pathNodes[i]); err != nil {
 			if err := smt.nodes.Delete(pathNodes[i]); err != nil {
 				return nil, err
