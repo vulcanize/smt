@@ -37,6 +37,8 @@ func (dsmst *DeepSparseMerkleSubTree) AddBranch(proof SparseMerkleProof, key []b
 		if err := dsmst.dirtyValues.Set(dsmst.th.path(key), value); err != nil {
 			return err
 		}
+		// Remove this key from the deleted cache if it exists
+		delete(dsmst.dirtyValueDeletes, string(dsmst.th.path(key)))
 	}
 
 	// Update nodes along branch
@@ -45,6 +47,8 @@ func (dsmst *DeepSparseMerkleSubTree) AddBranch(proof SparseMerkleProof, key []b
 		if err != nil {
 			return err
 		}
+		// Remove this key from the deleted cache if it exists
+		delete(dsmst.dirtyNodeDeletes, string(update[0]))
 	}
 
 	// Update sibling node
@@ -54,6 +58,8 @@ func (dsmst *DeepSparseMerkleSubTree) AddBranch(proof SparseMerkleProof, key []b
 			if err != nil {
 				return err
 			}
+			// Remove this key from the deleted cache if it exists
+			delete(dsmst.dirtyNodeDeletes, string(proof.SideNodes[0]))
 		}
 	}
 

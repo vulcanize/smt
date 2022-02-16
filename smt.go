@@ -16,22 +16,35 @@ var defaultValue = []byte{}
 var errKeyAlreadyEmpty = errors.New("key already empty")
 
 // SparseMerkleTree is a Sparse Merkle tree.
+// We need to be able to track which nodes have been deleted in the cache, and echo these
+// deletions back to the disk layer
+// We also need to be wary of the scenario where within the same cache/commit block we
+// delete and set the same key multiple times, we need to only reflect the latest state of those keys
 type SparseMerkleTree struct {
 	th            treeHasher
 	nodes, values MapStore
 	// TODO: make caching more intelligent, be able to configure a cache size and if we exceed this size auto-flush to disk
-	dirtyNodes, dirtyValues *SimpleMap
-	// TODO: separate cache for tracking delete operations
-	root        []byte
-	nodesListen chan []byte
-	kvListen    chan KVPair
-	// TODO: separate channel for indicating to a listening service which nodes were deleted
+	dirtyNodes, dirtyValues             *SimpleMap
+	dirtyNodeDeletes, dirtyValueDeletes map[string]struct{}
+	root                                []byte
+	nodesListen                         chan Node
+	kvListen                            chan KVPair
 }
 
-// KVPair for listening to KVPairs
+// Node struct for listening to nodes
+// Delete flag is included so that we can signify to an external service when to delete a given node
+type Node struct {
+	Hash    []byte
+	Content []byte
+	Delete  bool
+}
+
+// KVPair struct for listening to KVPairs
+// Delete flag is included so that we can signify to an external service when to delete a given KVPair
 type KVPair struct {
-	Key   string
-	Value []byte
+	Key    string
+	Value  []byte
+	Delete bool
 }
 
 // NewSparseMerkleTree creates a new Sparse Merkle tree on an empty MapStore.
@@ -119,12 +132,16 @@ func (smt *SparseMerkleTree) Has(key []byte) (bool, error) {
 // and, if the SMT is configured with listeners, it streams nodes and kvPairs to the listeners
 // this dirty streaming enables us to perform efficient statediffing- efficient export of SC + SS to an external service
 func (smt *SparseMerkleTree) Commit() error {
-	// TODO: separate map for tracking dirty deletes and signifying them to the listener
 	// I know this is ugly code replication, but it's better to perform two nil checks
-	// than a nil check on each iteration of dirtyNodes and dirtyValues
+	// than a nil check on each iteration of these maps
 	if smt.kvListen == nil {
 		for key, val := range smt.dirtyValues.m {
 			if err := smt.values.Set([]byte(key), val); err != nil {
+				return err
+			}
+		}
+		for key := range smt.dirtyNodeDeletes {
+			if err := smt.values.Delete([]byte(key)); err != nil {
 				return err
 			}
 		}
@@ -133,7 +150,13 @@ func (smt *SparseMerkleTree) Commit() error {
 			if err := smt.values.Set([]byte(key), val); err != nil {
 				return err
 			}
-			smt.kvListen <- KVPair{key, val}
+			smt.kvListen <- KVPair{key, val, false}
+		}
+		for key := range smt.dirtyNodeDeletes {
+			if err := smt.values.Delete([]byte(key)); err != nil {
+				return err
+			}
+			smt.kvListen <- KVPair{key, nil, true}
 		}
 	}
 	if smt.nodesListen == nil {
@@ -142,19 +165,30 @@ func (smt *SparseMerkleTree) Commit() error {
 				return err
 			}
 		}
+		for key := range smt.dirtyNodeDeletes {
+			if err := smt.nodes.Delete([]byte(key)); err != nil {
+				return err
+			}
+		}
 	} else {
 		for key, val := range smt.dirtyNodes.m {
 			if err := smt.nodes.Set([]byte(key), val); err != nil {
 				return err
 			}
-			smt.nodesListen <- val
+			smt.nodesListen <- Node{[]byte(key), val, false}
+		}
+		for key := range smt.dirtyNodeDeletes {
+			if err := smt.nodes.Delete([]byte(key)); err != nil {
+				return err
+			}
+			smt.nodesListen <- Node{[]byte(key), nil, true}
 		}
 	}
 	return nil
 }
 
 // SetNodeListener to configure the SMT with a channel to write dirty nodes out to during Commit
-func (smt *SparseMerkleTree) SetNodeListener(listener chan []byte) {
+func (smt *SparseMerkleTree) SetNodeListener(listener chan Node) {
 	smt.nodesListen = listener
 }
 
@@ -200,6 +234,8 @@ func (smt *SparseMerkleTree) UpdateForRoot(key []byte, value []byte, root []byte
 				return nil, err
 			}
 		}
+		// Cache the delete operation so that listeners can be made aware of them
+		smt.dirtyValueDeletes[string(path)] = struct{}{}
 
 	} else {
 		// Insert or update operation.
@@ -231,6 +267,8 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 				return nil, err
 			}
 		}
+		// Cache the delete operation so that listeners can be made aware of them
+		smt.dirtyNodeDeletes[string(node)] = struct{}{}
 	}
 
 	var currentHash, currentData []byte
@@ -277,6 +315,8 @@ func (smt *SparseMerkleTree) deleteWithSideNodes(path []byte, sideNodes [][]byte
 		if err := smt.dirtyNodes.Set(currentHash, currentData); err != nil {
 			return nil, err
 		}
+		// Remove this key from the deleted cache if it exists
+		delete(smt.dirtyNodeDeletes, string(currentHash))
 		currentData = currentHash
 	}
 
@@ -293,6 +333,8 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 	if err := smt.dirtyNodes.Set(currentHash, currentData); err != nil {
 		return nil, err
 	}
+	// Remove this key from the deleted cache if it exists
+	delete(smt.dirtyNodeDeletes, string(currentHash))
 	currentData = currentHash
 
 	// If the leaf node that sibling nodes lead to has a different actual path
@@ -321,6 +363,8 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 		if err != nil {
 			return nil, err
 		}
+		// Remove this key from the deleted cache if it exists
+		delete(smt.dirtyNodeDeletes, string(currentHash))
 
 		currentData = currentHash
 	} else if oldValueHash != nil {
@@ -335,11 +379,15 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 				return nil, err
 			}
 		}
+		// Cache the delete operation so that listeners can be made aware of them
+		smt.dirtyNodeDeletes[string(pathNodes[0])] = struct{}{}
 		if err := smt.dirtyValues.Delete(path); err != nil {
 			if err := smt.values.Delete(path); err != nil {
 				return nil, err
 			}
 		}
+		// Cache the delete operation so that listeners can be made aware of them
+		smt.dirtyValueDeletes[string(path)] = struct{}{}
 	}
 	// All remaining path nodes are orphaned
 	for i := 1; i < len(pathNodes); i++ {
@@ -350,6 +398,8 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 				return nil, err
 			}
 		}
+		// Cache the delete operation so that listeners can be made aware of them
+		smt.dirtyNodeDeletes[string(pathNodes[i])] = struct{}{}
 	}
 
 	// The offset from the bottom of the tree to the start of the side nodes.
@@ -382,11 +432,15 @@ func (smt *SparseMerkleTree) updateWithSideNodes(path []byte, value []byte, side
 		if err != nil {
 			return nil, err
 		}
+		// Remove this key from the deleted cache if it exists
+		delete(smt.dirtyNodeDeletes, string(currentHash))
 		currentData = currentHash
 	}
 	if err := smt.dirtyValues.Set(path, value); err != nil {
 		return nil, err
 	}
+	// Remove this key from the deleted cache if it exists
+	delete(smt.dirtyValueDeletes, string(path))
 
 	return currentHash, nil
 }
