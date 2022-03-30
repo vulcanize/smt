@@ -66,5 +66,6 @@ func (cm *CachedMapStore) Commit() error {
 			}
 		}
 	}
+	cm.cache = map[string]operation{}
 	return nil
 }
